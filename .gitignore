@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data files — generated, not committed
+data/*.duckdb
+data/*.parquet
+data/*.csv
+
+# Environment and secrets
+.env
+
+# Dagster
+.dagster/
+dagster_home/
+storage/
+schedules/
+
+# Type checking and linting caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Coverage reports
+htmlcov/
+.coverage
+coverage.xml
+
+# Private build notes — never committed
+notes/

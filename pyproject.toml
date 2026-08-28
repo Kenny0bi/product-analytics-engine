@@ -1,0 +1,42 @@
+[project]
+name = "product-analytics-engine"
+version = "1.0.0"
+description = "Product analytics platform: synthetic event generation, funnel/cohort/segment analytics, A/B statistics, forecasting, Dagster orchestration, FastAPI serving, Streamlit dashboard."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Kenny Obidele" }]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Correctness-focused: pycodestyle errors, pyflakes, import order, bugbear.
+select = ["E4", "E7", "E9", "F", "I", "B"]
+ignore = [
+    "B008",  # function call in argument defaults (FastAPI Query/Path idiom)
+    "B905",  # zip without strict= (paired lists are same-length by construction)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Streamlit pages access one private analyzer helper deliberately.
+"src/dashboard/pages/*" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+
+# These modules use DuckDB's fetchone()[0] on aggregate queries, which always
+# return exactly one row; mypy sees Optional and flags every index. Scoped
+# here instead of ignored inline at ~23 call sites.
+[[tool.mypy.overrides]]
+module = [
+    "src.data.ingestion",
+    "src.analytics.sessions",
+    "src.analytics.funnels",
+    "src.pipeline.backfill",
+]
+disable_error_code = ["index"]

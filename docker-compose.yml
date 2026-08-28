@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  # Main analytics service: FastAPI REST API + Streamlit dashboard
+  analytics:
+    build: .
+    ports:
+      - "8000:8000"   # FastAPI API
+      - "8501:8501"   # Streamlit dashboard
+    volumes:
+      - analytics-data:/app/data
+    environment:
+      - PAE_DB_PATH=/app/data/analytics.duckdb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Dagster pipeline orchestration service
+  dagster:
+    build: .
+    command: dagster-webserver -h 0.0.0.0 -p 3000 -m src.pipeline.definitions
+    ports:
+      - "3000:3000"   # Dagster webserver UI
+    volumes:
+      - analytics-data:/app/data
+    environment:
+      - PAE_DB_PATH=/app/data/analytics.duckdb
+      - DAGSTER_HOME=/app/.dagster
+      # The analytics service seeds the shared volume; don't race it.
+      - PAE_SKIP_SEED=1
+    depends_on:
+      analytics:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  analytics-data:
+    driver: local
