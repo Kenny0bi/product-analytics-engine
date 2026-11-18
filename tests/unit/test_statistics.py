@@ -88,26 +88,79 @@ class TestBayesianTests:
 
 
 class TestSequentialTesting:
-    """Tests for SPRT boundary calculations."""
+    """Tests for the paired two-sample SPRT."""
 
     def test_sprt_boundaries(self) -> None:
-        """Verify SPRT boundary formulas for alpha=0.05, beta=0.20.
+        """Pin the rails for alpha=0.05, beta=0.20.
 
-        Upper boundary B = log((1 - beta) / alpha) = log(0.80 / 0.05) = log(16) = 2.773
-        Lower boundary A = log(beta / (1 - alpha)) = log(0.20 / 0.95) = log(0.2105) = -1.558
-
-        These are the Wald boundaries for the sequential probability ratio test.
+        Upper (reject H0) B = log(1 / alpha) = log(20) = 2.996, Ville's bound,
+        so P(ever reaching B | H0) <= alpha under continuous monitoring.
+        Wald's log((1 - beta) / alpha) = log(16) = 2.773 only bounds it by
+        alpha / (1 - beta) = 0.0625.
+        Lower (accept H0) A = log(beta / (1 - alpha)) = log(0.2105) = -1.558.
         """
-        alpha = 0.05
-        beta = 0.20
-
-        B = math.log((1 - beta) / alpha)
+        alpha, beta = 0.05, 0.20
+        B = math.log(1 / alpha)
         A = math.log(beta / (1 - alpha))
-
-        assert abs(B - 2.773) < 0.01, f"Upper boundary B = {B}, expected ~2.773"
+        assert abs(B - 2.996) < 0.01, f"Upper boundary B = {B}, expected ~2.996"
         assert abs(A - (-1.558)) < 0.01, f"Lower boundary A = {A}, expected ~-1.558"
-        assert B > 0, "Upper boundary must be positive"
-        assert A < 0, "Lower boundary must be negative"
+
+    def test_only_discordant_pairs_move_the_llr(self) -> None:
+        """Pairs where both or neither converted carry no evidence.
+
+        The first pair uses the Beta(1, 1) prior mean p0 = 0.5, p1 = 0.52, so
+        theta_1 = 0.52 * 0.5 / (0.52 * 0.5 + 0.5 * 0.48) = 0.52 and a
+        treatment-only conversion adds log(2 * 0.52) = 0.0392.
+        """
+        from src.statistics.sequential import llr_path
+
+        path = llr_path(np.array([0, 1, 0]), np.array([1, 1, 0]), delta=0.02)
+        assert abs(path[0] - math.log(1.04)) < 1e-9
+        assert path[1] == path[0] and path[2] == path[0]
+
+    def test_first_crossing_decides(self) -> None:
+        """A path that touches the upper rail stops there, even if it falls back."""
+        from src.statistics.sequential import first_crossing
+
+        path = np.array([0.5, 1.5, 3.1, 2.0, -2.0])
+        assert first_crossing(path, 2.996, -1.558) == ("reject_null", 3)
+        assert first_crossing(np.array([0.1, -1.6]), 2.996, -1.558) == ("accept_null", 2)
+        assert first_crossing(np.array([0.1, 0.2]), 2.996, -1.558) == ("continue", None)
+
+    def test_aa_false_positive_rate_under_continuous_monitoring(self) -> None:
+        """With no true difference, checking after EVERY pair rejects at most ~alpha.
+
+        The previous design re-estimated the null rate from the control arm
+        at each check and rejected 12.9% of A/A experiments at alpha = 0.05.
+        600 A/A experiments of 3,000 pairs at p = 0.10: the rejection rate
+        must stay at or under alpha plus two standard errors.
+        """
+        from src.statistics.sequential import first_crossing, llr_path
+
+        rng = np.random.default_rng(2024)
+        B, A = math.log(1 / 0.05), math.log(0.20 / 0.95)
+        k, n = 600, 3000
+        rejected = 0
+        for _ in range(k):
+            c = (rng.random(n) < 0.10).astype(int)
+            t = (rng.random(n) < 0.10).astype(int)
+            rejected += first_crossing(llr_path(c, t, 0.02), B, A)[0] == "reject_null"
+        se = math.sqrt(0.05 * 0.95 / k)
+        assert rejected / k <= 0.05 + 2 * se, f"A/A rejection rate {rejected / k:.3f}"
+
+    def test_detects_a_real_lift(self) -> None:
+        """A true 10% -> 12% lift is caught most of the time within 20,000 pairs."""
+        from src.statistics.sequential import first_crossing, llr_path
+
+        rng = np.random.default_rng(7)
+        B, A = math.log(1 / 0.05), math.log(0.20 / 0.95)
+        k, n = 200, 20000
+        caught = 0
+        for _ in range(k):
+            c = (rng.random(n) < 0.10).astype(int)
+            t = (rng.random(n) < 0.12).astype(int)
+            caught += first_crossing(llr_path(c, t, 0.02), B, A)[0] == "reject_null"
+        assert caught / k >= 0.75, f"power {caught / k:.2f}"
 
 
 class TestPowerAnalysis:

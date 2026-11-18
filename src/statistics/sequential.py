@@ -2,34 +2,55 @@
 Sequential Probability Ratio Test (SPRT) for early-stopping in A/B experiments.
 
 Unlike fixed-horizon tests that require all data to be collected before analysis,
-SPRT allows continuous monitoring with mathematically guaranteed error-rate control.
-At each observation the cumulative log-likelihood ratio (LLR) is compared against
-two boundaries derived from the desired Type I (alpha) and Type II (beta) error
-rates.
+a sequential test can be checked after every user and still keep its false
+positive rate at alpha. That guarantee only holds if the test is built so the
+null hypothesis is fixed before the data arrives.
+
+Why the test is run on pairs
+----------------------------
+The first version of this module set the null rate theta_0 to the control arm's
+observed conversion rate and re-estimated it at every check. Under that design
+H0 moves with the data, the likelihood ratio is no longer a martingale under the
+null, and Wald's error bounds stop applying. Simulated A/A experiments (no true
+difference, 10 checks) rejected H0 12.9% of the time at alpha = 0.05.
+
+This version uses the classic two-sample construction. Control and treatment
+users are paired in assignment order. A pair where both or neither converted
+says nothing about which arm is better. In a pair where exactly one converted
+(a discordant pair), H0 "both arms share a rate" means the treatment user is
+the converter with probability exactly 1/2, whatever that shared rate is. So
+the null is exact and needs no estimate.
+
+The alternative is "treatment is delta above control". For a discordant pair it
+says the treatment user converts with probability
+
+    theta_1 = p_1 (1 - p_0) / (p_1 (1 - p_0) + p_0 (1 - p_1)),  p_1 = p_0 + delta
+
+p_0 is unknown, so it is estimated from the control users in EARLIER pairs only
+(with a Beta(1, 1) prior). Because each pair's alternative is fixed before that
+pair is seen, the likelihood ratio stays a non-negative martingale with mean 1
+under H0, and Ville's inequality bounds P(it ever reaches 1/alpha) by alpha, no
+matter how often it is checked.
 
 Boundaries
 ----------
-Upper (reject H0): B = ln((1 - beta) / alpha)
-Lower (accept H0): A = ln(beta / (1 - alpha))
-
-For binary outcomes the per-observation log-likelihood contribution is:
-
-    x_i * ln(theta_1 / theta_0) + (1 - x_i) * ln((1 - theta_1) / (1 - theta_0))
-
-where theta_0 = p_control (null hypothesis) and theta_1 = p_control + delta
-(alternative hypothesis with minimum detectable effect *delta*).
+Upper (reject H0): B = ln(1 / alpha)          (Ville; Wald's ln((1-beta)/alpha)
+                                               only bounds the error by alpha/(1-beta))
+Lower (accept H0): A = ln(beta / (1 - alpha)) (Wald)
 
 Decision rule
 -------------
-* LLR_n >= B  =>  reject H0 (significant effect detected)
-* LLR_n <= A  =>  accept H0 (no meaningful effect)
-* A < LLR_n < B  =>  continue testing
+The test stops at the FIRST pair where the cumulative LLR leaves (A, B):
+* crosses B first  =>  reject H0 (treatment better by about delta)
+* crosses A first  =>  accept H0 (no effect of size delta)
+* never crossed    =>  continue
 
 References
 ----------
-- Wald, A. *Sequential Analysis* (1947).
+- Wald, A. *Sequential Analysis* (1947), comparison of two binomial proportions.
+- Ville, J. *Etude critique de la notion de collectif* (1939).
 - Johari et al. "Always Valid Inference: Continuous Monitoring of A/B Tests"
-  (2017, Operations Research).
+  (Operations Research, 2022).
 """
 
 from __future__ import annotations
@@ -43,6 +64,45 @@ import numpy as np
 from loguru import logger
 from pydantic import BaseModel
 
+
+def _theta_1(p0: float | np.ndarray, p1: float | np.ndarray) -> Any:
+    """P(treatment user is the converter | discordant pair) under H1."""
+    return p1 * (1 - p0) / (p1 * (1 - p0) + p0 * (1 - p1))
+
+
+def llr_path(control: np.ndarray, treatment: np.ndarray, delta: float) -> np.ndarray:
+    """Cumulative log-likelihood ratio after each control/treatment pair.
+
+    Pair k contributes ln(2 theta_1) if only the treatment user converted,
+    ln(2 (1 - theta_1)) if only the control user converted, and 0 otherwise.
+    theta_1 for pair k uses the control rate from pairs 0..k-1 only, so the
+    alternative is always fixed before the pair it scores.
+    """
+    c = np.asarray(control, dtype=float)
+    t = np.asarray(treatment, dtype=float)
+    k = np.arange(len(c))
+    seen = np.concatenate([[0.0], np.cumsum(c)[:-1]])
+    p0 = (seen + 1) / (k + 2)
+    p1 = np.minimum(p0 + delta, 1 - 1e-9)
+    th = _theta_1(p0, p1)
+    inc = np.where(t > c, np.log(2 * th), np.where(t < c, np.log(2 * (1 - th)), 0.0))
+    return np.cumsum(inc)
+
+
+def first_crossing(path: np.ndarray, upper: float, lower: float) -> tuple[str, int | None]:
+    """Decision at the first pair where the path leaves (lower, upper).
+
+    Returns the decision and the 1-based pair number where it was made.
+    """
+    up = np.flatnonzero(path >= upper)
+    lo = np.flatnonzero(path <= lower)
+    if up.size == 0 and lo.size == 0:
+        return "continue", None
+    if lo.size == 0 or (up.size and up[0] < lo[0]):
+        return "reject_null", int(up[0]) + 1
+    return "accept_null", int(lo[0]) + 1
+
+
 # ---------------------------------------------------------------------------
 # Result model
 # ---------------------------------------------------------------------------
@@ -55,7 +115,9 @@ class SPRTResult(BaseModel):
     upper_boundary: float  # B (reject H0)
     lower_boundary: float  # A (accept H0)
     decision: str  # "reject_null" | "accept_null" | "continue"
-    observations_so_far: int
+    observations_so_far: int  # user pairs (one control + one treatment)
+    discordant_pairs: int  # pairs where exactly one user converted
+    stopped_at: int | None  # pair at which the LLR first left the corridor
     estimated_observations_remaining: int | None
     alpha: float
     beta: float
@@ -96,7 +158,7 @@ class SequentialTester:
         beta: float = 0.20,
         delta: float = 0.02,
     ) -> SPRTResult:
-        """Compute SPRT boundaries and the current cumulative LLR.
+        """Run the paired two-sample SPRT on everything observed so far.
 
         Parameters
         ----------
@@ -131,51 +193,31 @@ class SequentialTester:
             [experiment_id],
         ).fetchall()
 
-        # Estimate theta_0 (control rate) from control observations so far
-        control_outcomes = [r[1] for r in rows if r[0] == control_var]
-        treatment_outcomes = [r[1] for r in rows if r[0] == treatment_var]
+        control_outcomes = np.array([r[1] for r in rows if r[0] == control_var])
+        treatment_outcomes = np.array([r[1] for r in rows if r[0] == treatment_var])
+        n_obs = min(len(control_outcomes), len(treatment_outcomes))
+        if n_obs == 0:
+            raise ValueError("SPRT needs at least one control and one treatment observation")
 
-        if not control_outcomes:
-            raise ValueError("No control observations available for SPRT")
+        upper_boundary = math.log(1 / alpha)          # B (Ville)
+        lower_boundary = math.log(beta / (1 - alpha))  # A (Wald)
 
-        theta_0 = np.mean(control_outcomes)  # null: true rate = control rate
-        theta_1 = theta_0 + delta            # alternative: true rate = control + delta
+        path = llr_path(control_outcomes[:n_obs], treatment_outcomes[:n_obs], delta)
+        llr = float(path[-1])
+        decision, stop = first_crossing(path, upper_boundary, lower_boundary)
+        discordant = int(np.sum(control_outcomes[:n_obs] != treatment_outcomes[:n_obs]))
 
-        # Clamp to (0, 1) to avoid log(0)
-        theta_0 = max(min(theta_0, 1 - 1e-10), 1e-10)
-        theta_1 = max(min(theta_1, 1 - 1e-10), 1e-10)
-
-        # SPRT boundaries
-        upper_boundary = math.log((1 - beta) / alpha)  # B
-        lower_boundary = math.log(beta / (1 - alpha))   # A
-
-        # Cumulative log-likelihood ratio over treatment observations
-        log_ratio_1 = math.log(theta_1 / theta_0)
-        log_ratio_0 = math.log((1 - theta_1) / (1 - theta_0))
-
-        llr = 0.0
-        for x_i in treatment_outcomes:
-            llr += x_i * log_ratio_1 + (1 - x_i) * log_ratio_0
-
-        # Decision
-        if llr >= upper_boundary:
-            decision = "reject_null"
-        elif llr <= lower_boundary:
-            decision = "accept_null"
-        else:
-            decision = "continue"
-
-        # Rough estimate of remaining observations (Wald's expected sample size)
-        expected_info = (
-            theta_1 * log_ratio_1 + (1 - theta_1) * log_ratio_0
-        )
-        if abs(expected_info) > 1e-10 and decision == "continue":
-            est_total = int(abs(upper_boundary / expected_info))
-            est_remaining = max(est_total - len(treatment_outcomes), 0)
-        else:
-            est_remaining = None
-
-        n_obs = len(treatment_outcomes)
+        # Wald's expected sample size under H1, in pairs: B divided by the
+        # expected LLR gain per pair (P(discordant) * KL(theta_1 || 1/2)).
+        p0 = (control_outcomes[:n_obs].sum() + 1) / (n_obs + 2)
+        p1 = min(p0 + delta, 1 - 1e-9)
+        theta_1 = _theta_1(p0, p1)
+        p_disc = p1 * (1 - p0) + p0 * (1 - p1)
+        gain = p_disc * (theta_1 * math.log(2 * theta_1)
+                         + (1 - theta_1) * math.log(2 * (1 - theta_1)))
+        est_remaining: int | None = None
+        if decision == "continue" and gain > 1e-12:
+            est_remaining = max(int(math.ceil((upper_boundary - llr) / gain)), 0)
 
         logger.info(
             "SPRT for '{}': LLR={:.4f}, boundaries=[{:.4f}, {:.4f}], decision={}, n={}",
@@ -194,6 +236,8 @@ class SequentialTester:
             lower_boundary=round(lower_boundary, 6),
             decision=decision,
             observations_so_far=n_obs,
+            discordant_pairs=discordant,
+            stopped_at=stop,
             estimated_observations_remaining=est_remaining,
             alpha=alpha,
             beta=beta,

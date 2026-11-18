@@ -71,6 +71,8 @@ class SPRTResponse(BaseModel):
     lower_boundary: float
     decision: str
     observations_so_far: int
+    discordant_pairs: int = 0
+    stopped_at: int | None = None
     estimated_observations_remaining: int | None = None
 
 
@@ -186,6 +188,8 @@ async def get_sequential_test(
             lower_boundary=result.lower_boundary,
             decision=result.decision,
             observations_so_far=result.observations_so_far,
+            discordant_pairs=result.discordant_pairs,
+            stopped_at=result.stopped_at,
             estimated_observations_remaining=result.estimated_observations_remaining,
         )
     except Exception as exc:

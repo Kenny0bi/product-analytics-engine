@@ -32,7 +32,7 @@ The standard retention view is a red-to-green heatmap. Here each signup cohort i
 
 ### The anatomy of a decision
 
-Every experiment gets read three ways, because each answers a different question. The posterior landscape shows what we now believe each variant's true rate is (the overlap is the remaining doubt). The sequential decision corridor shows Wald's SPRT log-likelihood ratio walking between decision rails as users accumulate, which answers when we could have stopped. The power curve shows what the experiment could ever have detected in the first place.
+Every experiment gets read three ways, because each answers a different question. The posterior landscape shows what we now believe each variant's true rate is (the overlap is the remaining doubt). The sequential decision corridor shows the SPRT log-likelihood ratio walking between decision rails as user pairs accumulate, which answers when we could have stopped. The power curve shows what the experiment could ever have detected in the first place.
 
 ![Posterior landscape](docs/charts/posterior.png)
 ![SPRT decision corridor](docs/charts/sprt.png)
@@ -116,7 +116,11 @@ Everything below is computed from the actual generated dataset (seed 42), not as
 | pricing_page_copy | +15.6% revenue per user | +16.3% ($45.94 to $53.42) | <0.0001 | >99.9% | Ship it |
 | onboarding_tutorial | slightly negative (35% to 33%) | -6.1% | 0.0429 | 2.1% | Keep control |
 
-All three recover their designed truth, including the third one: it was built as a mildly harmful change, and both the frequentist and Bayesian reads catch it and recommend the control. The sequential test on the checkout experiment crosses Wald's reject boundary (LLR 6.74 against a 2.77 rail), meaning it could have been stopped early with error rates intact.
+All three recover their designed truth, including the third one: it was built as a mildly harmful change, and both the frequentist and Bayesian reads catch it and recommend the control. The sequential test on the checkout experiment crosses its reject rail (ln 20 = 3.00) at pair 1,154 of 5,000, so it could have been stopped after about a quarter of the traffic with the false-positive rate still held at 5%.
+
+**The sequential test I had to fix.** This README used to say that same test crossed at an LLR of 6.74 against a 2.77 rail. That number was real, and it was wrong. My first SPRT set the null rate to the control arm's observed conversion rate and re-estimated it every time the test was checked. A sequential test only keeps its error rates when the hypotheses are fixed before the data arrives, and mine moved with the data. I tested it the only honest way, with experiments where I knew the answer: 1,000 A/A experiments (no true difference), 2,000 users per arm, checked 10 times as data came in. A z-test read once at the end flagged 4.0% of them, as it should. Peeking at that z-test at every look flagged 18.7%. My SPRT flagged 12.9%. Better than naive peeking, but more than double the 5% it promised.
+
+The fix is the two-sample construction in Wald's own book. Pair control and treatment users in assignment order. A pair where both or neither converted says nothing about which arm is better. In a pair where exactly one converted, "no difference" means the treatment user is the converter with probability exactly 1/2, whatever the base rate is, so the null needs no estimate at all. The alternative still needs a base rate, so each pair uses the control rate from earlier pairs only. That keeps the likelihood ratio a martingale under the null, and Ville's inequality caps the false-positive rate at alpha no matter how often you look. It is also why the reject rail is now ln(1/alpha) rather than Wald's ln((1-beta)/alpha), which only bounds the error by alpha/(1-beta), 6.25%. Run through the same 1,000 A/A experiments and 10 looks that exposed the bug, the paired test flags 1.7%. Checked after every single pair, 4,000 A/A experiments of 20,000 pairs each reject 3.3% to 3.9% of the time at base rates of 3%, 10% and 30%, and a real 10% to 12% lift gets caught 85% of the time. A smaller version of that A/A check is now a unit test, so this can't come back quietly, and `python scripts/simulate_sequential.py` reproduces every number in this section from the repo's own code.
 
 ## Statistical methods
 
@@ -124,7 +128,7 @@ The A/B layer runs every experiment through both schools:
 
 - **Frequentist**: two-proportion z-test with pooled standard error for binary metrics (chi-squared computed as a cross-check; for a 2x2 table chi2 = z²), Welch's t-test with Welch-Satterthwaite degrees of freedom for continuous metrics, Cohen's h/d effect sizes, and post-hoc power via the non-central distribution.
 - **Bayesian**: conjugate Beta-Bernoulli posteriors sampled by Monte Carlo (100K draws) to get P(treatment > control), the expected relative lift with a 95% credible interval, and the expected loss of each decision, which is the number I would actually want in a launch review: how much conversion do I give up if I ship the wrong variant?
-- **Sequential**: Wald's SPRT with boundaries A = ln(beta/(1-alpha)) and B = ln((1-beta)/alpha), so an experiment can be monitored continuously with controlled error rates instead of waiting for a fixed horizon.
+- **Sequential**: a paired two-sample SPRT on discordant pairs (exact null of 1/2, alternative from earlier pairs only), with accept rail A = ln(beta/(1-alpha)) and reject rail B = ln(1/alpha), so an experiment can be checked after every user pair and still hold its false-positive rate at alpha instead of waiting for a fixed horizon.
 - **Planning**: two-proportion and two-sample sample-size formulas, plus power-versus-n curves rendered per experiment.
 
 Forecasting uses Holt-Winters exponential smoothing (additive trend and weekly seasonality) with model fallbacks for short series, and prediction intervals that widen with sqrt(horizon). Anomaly detection runs Isolation Forest over engineered features (rolling statistics, day-of-week, deviation z-scores) alongside a 3-sigma control chart, and flags a day if either method fires.
@@ -172,7 +176,7 @@ dagster dev -m src.pipeline.definitions
 | `GET /api/v1/retention` | Cohort retention matrix (weekly or monthly) |
 | `GET /api/v1/retention/curve` | Average retention curve across cohorts |
 | `GET /api/v1/experiments/{id}` | Full frequentist + Bayesian analysis |
-| `GET /api/v1/experiments/{id}/sequential` | SPRT state and decision |
+| `GET /api/v1/experiments/{id}/sequential` | SPRT state, decision and the pair where it stopped |
 | `POST /api/v1/experiments/power` | Sample-size calculation for planning |
 | `GET /api/v1/segments/rfm` | RFM segment profiles |
 | `GET /api/v1/segments/clusters` | Behavioral cluster profiles |
@@ -181,7 +185,7 @@ dagster dev -m src.pipeline.definitions
 
 ## Testing
 
-48 tests run in CI (GitHub Actions: ruff, mypy, then pytest against a freshly generated dataset). The unit tests pin the statistics to hand-calculated values (a known z-test example, SPRT boundary formulas, sample-size formulas), verify generator invariants (distributions, temporal ordering, referential integrity), and the integration tests exercise every API endpoint against a real DuckDB instance.
+52 tests run in CI (GitHub Actions: ruff, mypy, then pytest against a freshly generated dataset). The unit tests pin the statistics to hand-calculated values (a known z-test example, SPRT rails, sample-size formulas), simulate 600 A/A experiments to check the sequential test's false-positive rate under continuous monitoring, verify generator invariants (distributions, temporal ordering, referential integrity), and the integration tests exercise every API endpoint against a real DuckDB instance.
 
 One testing lesson I'll keep: a test that passes vacuously is worse than no test. An early version of the session-ordering test did `dropna()` before asserting start <= end, which meant it kept passing while a write-back bug left every session's `ended_at` null. The generated sessions loaded cleanly, the dashboards would have shown 0% conversion everywhere, and the suite was green. The fixed test asserts the aggregates are populated before checking their ordering, and finding that class of bug is exactly why I now make tests assert presence, not just consistency.
 
@@ -213,6 +217,8 @@ docs/charts/     Rendered chart images used in this README
 
 - Kohavi, Tang, Xu. *Trustworthy Online Controlled Experiments* (2020)
 - Wald. *Sequential Analysis* (1947)
+- Ville. *Étude critique de la notion de collectif* (1939)
+- Johari, Koomen, Pekelis and Walsh. "Always Valid Inference: Continuous Monitoring of A/B Tests" (*Operations Research*, 2022)
 - Gelman et al. *Bayesian Data Analysis*, 3rd ed.
 - Hyndman, Athanasopoulos. *Forecasting: Principles and Practice*
 - Liu et al. "Isolation Forest" (ICDM 2008)

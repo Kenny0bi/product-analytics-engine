@@ -26,7 +26,7 @@ from scipy import stats
 from src.dashboard import theme as T
 from src.statistics.ab_testing import ABTestAnalyzer
 from src.statistics.power_analysis import PowerAnalyzer
-from src.statistics.sequential import SequentialTester
+from src.statistics.sequential import SequentialTester, llr_path
 
 
 def _rgba(hex_color: str, a: float) -> str:
@@ -93,12 +93,15 @@ def _posterior_chart(stats_by_variant: dict, metric_type: str) -> go.Figure:
 
 
 def _sprt_chart(conn, experiment_id: str, sprt) -> go.Figure:
-    """The LLR trajectory between Wald's decision boundaries.
+    """The LLR trajectory between the decision rails.
 
-    Recomputes the cumulative log-likelihood ratio per treatment
-    observation with the same likelihood model as SequentialTester, so
-    the path shown ends exactly at the tester's reported LLR.
+    Recomputes the per-pair log-likelihood ratio with the same function
+    SequentialTester uses (llr_path), so the path ends exactly at the
+    tester's reported LLR and its first rail crossing is the reported stop.
     """
+    meta = conn.execute(
+        "select control_variant, treatment_variant from experiments "
+        "where experiment_id = ?", [experiment_id]).fetchone()
     rows = conn.execute("""
         select ea.variant, case when ea.converted then 1 else 0 end
         from experiment_assignments ea
@@ -106,19 +109,16 @@ def _sprt_chart(conn, experiment_id: str, sprt) -> go.Figure:
         order by ea.assigned_at
     """, [experiment_id]).fetchall()
 
-    control = [r[1] for r in rows if r[0] == "control"]
-    treatment = [r[1] for r in rows if r[0] == "treatment"]
-    theta_0 = min(max(float(np.mean(control)), 1e-10), 1 - 1e-10)
-    theta_1 = min(max(theta_0 + sprt.delta, 1e-10), 1 - 1e-10)
-    lr1 = math.log(theta_1 / theta_0)
-    lr0 = math.log((1 - theta_1) / (1 - theta_0))
-    llr_path = np.cumsum([x * lr1 + (1 - x) * lr0 for x in treatment])
-    ns = np.arange(1, len(llr_path) + 1)
+    control = np.array([r[1] for r in rows if r[0] == meta[0]])
+    treatment = np.array([r[1] for r in rows if r[0] == meta[1]])
+    n = min(len(control), len(treatment))
+    path = llr_path(control[:n], treatment[:n], sprt.delta)
+    ns = np.arange(1, len(path) + 1)
 
     fig = T.base_figure(height=340)
     upper, lower = sprt.upper_boundary, sprt.lower_boundary
     pad = (upper - lower) * 0.45
-    x_max = len(llr_path)
+    x_max = len(path)
 
     # Decision regions.
     fig.add_hrect(y0=upper, y1=upper + pad, fillcolor=_rgba(T.TEAL, 0.12),
@@ -137,23 +137,33 @@ def _sprt_chart(conn, experiment_id: str, sprt) -> go.Figure:
                        font=dict(family=T.FONT_UI, size=11, color=T.SERIOUS))
 
     fig.add_trace(go.Scatter(
-        x=ns, y=llr_path, mode="lines", name="cumulative LLR",
+        x=ns, y=path, mode="lines", name="cumulative LLR",
         line=dict(color=T.INK, width=2),
-        hovertemplate="after %{x:,} users: LLR %{y:.2f}<extra></extra>",
+        hovertemplate="after %{x:,} pairs: LLR %{y:.2f}<extra></extra>",
     ))
+    if sprt.stopped_at is not None:
+        k = sprt.stopped_at
+        fig.add_vline(x=k, line=dict(color=T.INK_MUTED, width=1, dash="dot"))
+        # label on the far side of zero from the rail it crossed, clear of the path
+        label_y = lower * 0.6 if sprt.decision == "reject_null" else upper * 0.6
+        fig.add_annotation(
+            x=k, y=label_y, text=f" stops here: pair {k:,}", xanchor="left",
+            showarrow=False,
+            font=dict(family=T.FONT_MONO, size=11, color=T.INK),
+        )
     fig.add_trace(go.Scatter(
-        x=[ns[-1]], y=[llr_path[-1]], mode="markers",
+        x=[ns[-1]], y=[path[-1]], mode="markers",
         marker=dict(size=10, color=T.INK, line=dict(color=T.PAPER, width=2)),
         hoverinfo="skip", showlegend=False,
     ))
     fig.add_annotation(
-        x=ns[-1], y=llr_path[-1],
-        text=f"now: {llr_path[-1]:.2f}", showarrow=True, arrowhead=0,
+        x=ns[-1], y=path[-1],
+        text=f"now: {path[-1]:.2f}", showarrow=True, arrowhead=0,
         ax=-10, ay=-22, arrowcolor=T.INK_MUTED,
         font=dict(family=T.FONT_MONO, size=11, color=T.INK),
     )
 
-    fig.update_xaxes(title="treatment users observed")
+    fig.update_xaxes(title="user pairs observed (one control, one treatment)")
     fig.update_yaxes(title="log-likelihood ratio")
     fig.update_layout(showlegend=False)
     return fig
@@ -301,7 +311,7 @@ def render(conn) -> None:
     if is_binary:
         T.rule(st)
         st.markdown("**The decision corridor** &middot; sequential probability "
-                    "ratio test: the evidence walking between Wald's rails")
+                    "ratio test on user pairs: the evidence walking between the rails")
         tester = SequentialTester(conn)
         sprt = tester.compute_sprt(exp_id)
         st.plotly_chart(_sprt_chart(conn, exp_id, sprt),
@@ -317,6 +327,7 @@ def render(conn) -> None:
         st.caption(
             f"alpha = {sprt.alpha}, beta = {sprt.beta}, minimum detectable "
             f"effect = {sprt.delta:.0%} absolute. After "
-            f"{T.fmt_int(sprt.observations_so_far)} treatment observations "
+            f"{T.fmt_int(sprt.observations_so_far)} user pairs "
+            f"({T.fmt_int(sprt.discordant_pairs)} where only one converted) "
             f"the path has {decision_txt}."
         )
