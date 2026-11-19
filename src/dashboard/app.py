@@ -64,8 +64,10 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    # Streamlit types radio/selectbox as Optional; with options and a default
+    # index they always return a value, so fall back to the first option.
     page_name = st.sidebar.radio("Navigation", list(_PAGES.keys()),
-                                 label_visibility="collapsed")
+                                 label_visibility="collapsed") or next(iter(_PAGES))
 
     st.sidebar.markdown(
         f'<div style="margin-top:2rem;font-size:0.78rem;color:{T.INK_MUTED};">'

@@ -217,7 +217,7 @@ def render(conn) -> None:
                                min_value=min_d, max_value=max_d)
     with c3:
         seg_label = st.selectbox("Compare by segment",
-                                 list(_SEGMENT_FIELDS.keys()))
+                                 list(_SEGMENT_FIELDS.keys())) or next(iter(_SEGMENT_FIELDS))
 
     if len(steps) < 2:
         st.warning("Pick at least two steps.")

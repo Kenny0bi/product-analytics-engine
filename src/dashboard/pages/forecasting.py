@@ -184,7 +184,7 @@ def render(conn) -> None:
 
     c1, c2 = st.columns([2, 2])
     with c1:
-        metric_label = st.selectbox("Metric", list(_METRICS.keys()))
+        metric_label = st.selectbox("Metric", list(_METRICS.keys())) or next(iter(_METRICS))
     with c2:
         horizon = st.slider("Forecast horizon (days)", 7, 90, 30)
     metric = _METRICS[metric_label]

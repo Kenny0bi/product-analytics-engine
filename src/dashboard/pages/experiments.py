@@ -234,7 +234,7 @@ def render(conn) -> None:
 
     exp_display = {f"{name} ({metric})": eid
                    for eid, name, metric, _ in experiments}
-    choice = st.selectbox("Experiment", list(exp_display.keys()))
+    choice = st.selectbox("Experiment", list(exp_display.keys())) or next(iter(exp_display))
     exp_id = exp_display[choice]
 
     analyzer = ABTestAnalyzer(conn)

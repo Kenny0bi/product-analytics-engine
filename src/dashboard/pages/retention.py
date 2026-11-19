@@ -163,7 +163,7 @@ def render(conn) -> None:
 
     c1, c2, c3 = st.columns([1, 2, 1])
     with c1:
-        period = st.radio("Cohort period", ["month", "week"], horizontal=True)
+        period = st.radio("Cohort period", ["month", "week"], horizontal=True) or "month"
     with c2:
         num_periods = st.slider("Periods to show", 4, 24,
                                 12 if period == "month" else 16)
